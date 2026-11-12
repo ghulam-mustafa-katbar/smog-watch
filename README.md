@@ -27,6 +27,12 @@ In case of upstream network timeouts or sensor station outages, the application 
 
 ## Running Locally
 
+### Clone Repository
+```bash
+git clone https://github.com/ghulam-mustafa-katbar/smog-watch.git
+cd smog-watch
+```
+
 ### Installation
 ```bash
 pip install -r requirements.txt

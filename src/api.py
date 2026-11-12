@@ -1,13 +1,23 @@
 """API client module for fetching atmospheric air quality data from Open-Meteo.
 
 Includes connection pooling, exponential backoff retries, strict timeouts,
-structured error handling, and zero data fabrication.
+structured error handling, zero data fabrication, and graceful fallback to
+Python standard library urllib when requests is not installed.
 """
+import json
 import logging
 from typing import Dict, Any, Optional
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util import Retry
+    HAS_REQUESTS = True
+except ImportError:
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    HAS_REQUESTS = False
 
 from src.config import (
     API_BASE_URL,
@@ -40,11 +50,18 @@ class AirQualityAPIClient:
     ):
         self.base_url = base_url
         self.timeout = (connect_timeout, read_timeout)
-        self.session = self._create_resilient_session(retry_total, retry_backoff)
+        self.retry_total = retry_total
+        self.retry_backoff = retry_backoff
+        if HAS_REQUESTS:
+            self.session = self._create_resilient_session(retry_total, retry_backoff)
+        else:
+            self.session = None
 
     @staticmethod
-    def _create_resilient_session(retry_total: int, backoff_factor: float) -> requests.Session:
+    def _create_resilient_session(retry_total: int, backoff_factor: float) -> Any:
         """Create a requests Session configured with urllib3 Retry adapter."""
+        if not HAS_REQUESTS:
+            return None
         session = requests.Session()
         retry_strategy = Retry(
             total=retry_total,
@@ -76,7 +93,7 @@ class AirQualityAPIClient:
                 - 'status': 'success' | 'error'
                 - 'error_message': Optional[str]
                 - 'timestamp': Optional[str]
-                - 'pollutants': Dict[str, Optional[float]] (actual readings in µg/m³)
+                - 'pollutants': Dict[str, Optional[float]]
                 - 'aqi': Optional[int]
                 - 'dominant_pollutant': Optional[str]
                 - 'category': Dict[str, Any]
@@ -101,6 +118,13 @@ class AirQualityAPIClient:
             "forecast_days": 1
         }
 
+        if HAS_REQUESTS and self.session:
+            return self._fetch_with_requests(city_name, params)
+        else:
+            return self._fetch_with_urllib(city_name, params)
+
+    def _fetch_with_requests(self, city_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch using requests Session."""
         try:
             response = self.session.get(
                 self.base_url,
@@ -118,7 +142,7 @@ class AirQualityAPIClient:
             )
         except requests.exceptions.HTTPError as e:
             logger.error("HTTP error for %s: %s", city_name, e)
-            status_code = response.status_code if 'response' in locals() else "Unknown"
+            status_code = getattr(response, "status_code", "Unknown") if 'response' in locals() else "Unknown"
             return self._build_error_response(
                 city_name,
                 f"Upstream HTTP error (Status: {status_code})."
@@ -135,6 +159,41 @@ class AirQualityAPIClient:
                 city_name,
                 "Malformed response payload received from air quality service."
             )
+
+        return self._parse_api_payload(city_name, payload)
+
+    def _fetch_with_urllib(self, city_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback fetch using standard library urllib."""
+        query_items = []
+        for k, v in params.items():
+            if isinstance(v, list):
+                query_items.append((k, ",".join(str(item) for item in v)))
+            else:
+                query_items.append((k, str(v)))
+
+        query_str = urllib.parse.urlencode(query_items)
+        url = f"{self.base_url}?{query_str}"
+        req = urllib.request.Request(url, headers={"User-Agent": "SmogWatch/1.0"})
+
+        timeout_sec = self.timeout[1] if isinstance(self.timeout, tuple) else self.timeout
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                raw_bytes = resp.read()
+                payload = json.loads(raw_bytes.decode("utf-8"))
+
+        except urllib.error.HTTPError as e:
+            logger.error("HTTP error for %s: %s", city_name, e)
+            return self._build_error_response(city_name, f"Upstream HTTP error (Status: {e.code}).")
+        except urllib.error.URLError as e:
+            logger.error("URL error for %s: %s", city_name, e)
+            return self._build_error_response(city_name, f"Connection failure: {str(e.reason)}")
+        except TimeoutError:
+            logger.error("Timeout fetching air quality for %s", city_name)
+            return self._build_error_response(city_name, "Network request timed out.")
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", city_name, e)
+            return self._build_error_response(city_name, f"Communication error: {str(e)}")
 
         return self._parse_api_payload(city_name, payload)
 
